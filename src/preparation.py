@@ -67,6 +67,8 @@ import numpy as np
 
 import json
 import gc
+from time import sleep, time
+import sys
 
 # check whether we are in repo root, if not, change working directory
 import os
@@ -120,6 +122,8 @@ class RawCSVtoMLN:
         self.edge_conf = edge_conf
         self.layer_conf = layer_conf
         self.output_folder = output_folder
+        self.grouped = False
+
 
         # check if output folder is empty, if not, add / to end
         if self.output_folder != "":
@@ -133,6 +137,22 @@ class RawCSVtoMLN:
     ###########################
     ##### LAYERS    ###########
     ###########################
+
+    def _open_file(self, read_func, *args, **kwargs):
+        success = 0
+        iter = 0
+        while not success and iter < 5:
+            try:
+                result = read_func(*args,**kwargs)
+                success = 1
+            except FileNotFoundError:
+                iter +=1
+        if success:
+            print(f"\tRead file on attempt no. {iter+1}.")
+        else:
+            raise FileNotFoundError("Could not read file in 5 attempts.")
+        return result
+            
         
     def init_layers(self):
         """
@@ -147,7 +167,8 @@ class RawCSVtoMLN:
                 self.init_raw_layers_from_edges()
             else:
                 print("\tReading raw layer input file...")
-                self.layers = pd.read_csv(
+                self.layers = self._open_file(
+                    pd.read_csv,
                     self.layer_conf["input_folder_prefix"] + self.layer_conf["raw_file"],
                     index_col=None,
                     header=0,
@@ -162,6 +183,11 @@ class RawCSVtoMLN:
                 self.layers.rename(columns = self.layer_conf["colmap"], inplace = True)
 
             print("\tAdding binary representation, groups and long labels...")
+            if self.grouped:
+                grps = dict(zip(self.layers["group_layer"],self.layers["group_label"]))
+                self.layers_ungrouped = self.layers
+                self.layer_mapping = dict(zip(self.layers_ungrouped["layer"],self.layers_ungrouped["group_layer"]))
+                self.layers = pd.DataFrame(np.array([list(grps.keys()),list(grps.values())]).T,columns = ["layer","label"])
             # creating different 2**i numbers for all linktypes for binary encoding
             self.layers["binary"] = self.layers.index.map(lambda i: int(2**i))
             if "group" not in self.layers:
@@ -192,6 +218,7 @@ class RawCSVtoMLN:
         This function reads the raw edgelist file and creates a layer dataframe
         from the different linktypes.
         """
+        raise ValueError("To initialize layers from edgelist is not yet done.")
         # getting all layer types
         layers = self.edgelist["layer"].unique()
         # creating layer dataframe
@@ -223,13 +250,15 @@ class RawCSVtoMLN:
 
             print(f"Reading file {p}...")
             if p.endswith('gz'):
-                node_df = pd.read_csv(p,sep=self.node_conf["sep"],index_col=None,compression='gzip')#,nrows=10)
+                node_df = self._open_file(pd.read_csv,p,sep=self.node_conf["sep"],index_col=None,compression='gzip')#,nrows=10)
+            elif p.endswith('sav'):
+                node_df = self._open_file(pd.read_spss,p,usecols = self.node_conf["colmap"].keys(),convert_categoricals=False)
             else:
-                node_df = pd.read_csv(p,sep=self.node_conf["sep"],index_col=None)#,nrows=10)
+                node_df = self._open_file(pd.read_csv,p,sep=self.node_conf["sep"],index_col=None)#,nrows=10)
             if self.node_conf["colmap"] != "":
-                for k,v in self.node_conf["colmap"].items():
-                    if k in node_df and v == None:
-                        node_df.drop(k,axis=1,inplace=True)
+                for c in node_df.columns:
+                    if c not in self.node_conf["colmap"]:
+                        node_df.drop(c,axis=1,inplace=True)
                 node_df.rename(columns = self.node_conf["colmap"],inplace=True)
             print(node_df.head())
             node_df.set_index("label",inplace=True)
@@ -237,64 +266,25 @@ class RawCSVtoMLN:
         
         if self.node_conf["files"]!="":
             print("Merging all node files...")
+            # TODO: check for joins, we might lose some lines here!
             nodes = pd.concat([get_node_file(f) for f in self.node_conf["files"]], axis=1)     
 
             # make label a column
             nodes.reset_index(inplace=True) 
-            # add ids
-            nodes.reset_index(inplace=True)
-            # renaming columns to human readable and consistency
-            nodes.rename(columns={"index":"id"},inplace=True)
+            if "id" not in nodes.columns:
+                # add ids if they don't exist
+                nodes.reset_index(inplace=True)
+                # renaming columns to human readable and consistency
+                nodes.rename(columns={"index":"id"},inplace=True)
 
             self.nodes = nodes
             print("Initialized node dataframe.")
         else:
-            source = self.edgelist["source"].unique()
-            target = self.edgelist["target"].unique()
-            nodes = pd.DataFrame({"label": np.unique(np.concatenate((source,target)))})
-            nodes.reset_index(inplace=True)
-            nodes.rename(columns={"index":"id"},inplace=True)
-            self.nodes = nodes
+            raise ValueError("To initialize nodelist from edgelist is not yet done.")
 
     ###########################
     ##### EDGES    ############
     ###########################
-
-    def read_edgelist(self):
-        """
-        This function reads the edgelist file and creates a pandas.DataFrame
-        with the edgelist.
-
-        It is not memory efficient if the edgelists are very large, it reads everything.
-        """
-
-        if self.edge_conf["colmap"] != "":
-            if type(self.edge_conf["colmap"]) == str:
-                self.edge_conf["colmap"] = json.load(open(self.edge_conf["colmap"]))
-
-        if self.edge_conf["input_folder_prefix"] != "":
-            if not self.edge_conf["input_folder_prefix"].endswith("/"):
-                self.edge_conf["input_folder_prefix"] += "/"
-                for i in range(len(self.edge_conf["files"])):
-                    self.edge_conf["files"][i] = self.edge_conf["input_folder_prefix"] + self.edge_conf["files"][i]
-
-        edgelists = []
-
-        for ef in self.edge_conf["files"]:
-            print(f"Reading edge file {ef}...")
-            # loading file
-            print("\tLoading file...")
-            edgelist = pd.read_csv(ef, sep=self.edge_conf["sep"],header=0)#,nrows=1000000)
-            if self.edge_conf["colmap"]!="":
-                for k,v in self.edge_conf["colmap"].items():
-                    if v == None and k in edgelist.columns:
-                        edgelist.drop(k,inplace=True,axis=1)
-                    else:
-                        edgelist.rename(columns = {k:v},inplace=True)
-            edgelists.append(edgelist)
-            print("\tDone.")
-
-        self.edgelist = pd.concat(edgelists,ignore_index=True)
 
     def init_edges(self):
         # getting id <-> label mappings
@@ -303,7 +293,7 @@ class RawCSVtoMLN:
 
         self.N = len(self.nodemap.keys())
         print(f"N is {self.N}")
-        self.A = csr_matrix((self.N,self.N), dtype='int')
+        self.A = csr_matrix((self.N,self.N), dtype=np.uint64)
     
     def adjacency_matrix(self, edgelist, binary, symmetrize=False):
         """
@@ -317,13 +307,15 @@ class RawCSVtoMLN:
             sparse adjacency matrix
         """
         # remapping labels to integer ids from 0 to N-1 to load into sparse CSR matrix
-        print("\t\tMapping edgelist.")
-        i = edgelist["source"].map(self.nodemap).tolist()
-        j = edgelist["target"].map(self.nodemap).tolist()
+        i = pd.Series(map(lambda x: self.nodemap.get(x),edgelist["source"]))
+        j = pd.Series(map(lambda x: self.nodemap.get(x),edgelist["target"]))
+
+        in_nodelist = ~pd.isnull(i)&~pd.isnull(j)
+        i = i[in_nodelist]
+        j = j[in_nodelist]
 
         # if creating / enforcing undirected graph
         if symmetrize:
-            print("\t\tSymmetrizing connections...")
             sym_i = i+j
             sym_j = j+i
             i = sym_i
@@ -331,14 +323,19 @@ class RawCSVtoMLN:
             j = sym_j
             del sym_j
         
-        print("\t\tCreating adjacency matrix.")
-        A = csr_matrix((np.ones(len(i)),(i,j)), shape=(self.N,self.N), dtype =  'int')
+        A = csr_matrix((np.ones(len(i)),(i,j)), shape=(self.N,self.N), dtype = np.uint64)
         if symmetrize:
-            A = csr_matrix(A>0, dtype='int')
+            A = csr_matrix(A>0, dtype=np.uint64)
         #  we multiply to 1/0 matrix by that number so that it corresponds to a certain edgetype
         A *= binary
 
         return A
+    
+    def _print_size(self,var,name=""):
+        """
+        Prints variable size in GB to allow for memory control.
+        """
+        print(f"{name}: {round(sys.getsizeof(var)/1024**3,2)}GB")
 
     def read_all_edges(self):
         """
@@ -364,36 +361,96 @@ class RawCSVtoMLN:
         if self.layer_conf["symmetrize_all"]:
             self.layer_conf["symmetrize"] = self.layers["layer"].tolist()
 
-        for layer in self.layers["layer"]:
-            # linktype name
-            name = self.layers.set_index("layer").loc[layer]["label_long"]
-            print(f"\tReading layer {name} with code {layer}...")
-            binary = self.layers.set_index("layer").loc[layer]["binary"]
-            selection = self.edgelist["layer"]==layer
-            num_edges = (selection).sum()
-            print(f"\tStarting adjacency function for {num_edges} edges...")
-            # contains values of binary_linktype / 0
-            if num_edges>0:
-                A = self.adjacency_matrix(self.edgelist[selection], binary, symmetrize=layer in self.layer_conf["symmetrize"])
-                self.A += A
-                print(f"\t\tAdding {A.nnz} edges.")
-                # cleaning memory of large unnecessary objects
-                del A
-                gc.collect()
-            print("\tDone.")
-        gc.collect()
+        if self.grouped:
+            l_list = self.layers_ungrouped["layer"]
+        else:
+            l_list = self.layers["layer"]
+
+        # get chunks of the edgelist
+        if self.edge_conf["colmap"] != "":
+            if type(self.edge_conf["colmap"]) == str:
+                self.edge_conf["colmap"] = json.load(open(self.edge_conf["colmap"]))
+
+        if self.edge_conf["input_folder_prefix"] != "":
+            if not self.edge_conf["input_folder_prefix"].endswith("/"):
+                self.edge_conf["input_folder_prefix"] += "/"
+                for i in range(len(self.edge_conf["files"])):
+                    self.edge_conf["files"][i] = self.edge_conf["input_folder_prefix"] + self.edge_conf["files"][i]
+
+        # START HEAVY PART
+        chunksize = int(2e8)
+
+        # read all edge files
+        for ef in self.edge_conf["files"]:
+            print(f"Reading edge file {ef}...")
+            # loading file in chunks
+            print("\tLoading file in chunks...")
+            tic  = time()
+            iter = 0
+            with self._open_file(pd.read_csv,ef, sep=self.edge_conf["sep"],header=0,chunksize=chunksize) as reader:
+                # for all chunks
+                for chunk in reader:
+                    iter += 1
+                    self._print_size(chunk,"\tSize of current chunk")
+                    print(f"\tChunk no. {iter}")
+                    if self.edge_conf["colmap"]!="":
+                        for k,v in self.edge_conf["colmap"].items():
+                            if v == None and k in chunk.columns:
+                                chunk.drop(k,inplace=True,axis=1)
+                            else:
+                                chunk.rename(columns = {k:v},inplace=True)
+
+                    # make sure node labels are integers for the mapping to work
+                    if chunk["source"].dtype!=int:
+                        chunk["source"] = chunk["source"].map(int)
+                    if chunk["target"].dtype!=int:
+                        chunk["target"] = chunk["target"].map(int)
+
+                    # check for layers in chunk and add them to adjacency matrix
+                    for l in l_list:
+                        if not self.grouped:
+                            layer = l
+                        else:
+                            layer = self.layer_mapping[l]
+                        # linktype name
+                        name = self.layers.set_index("layer").loc[layer]["label_long"]
+                        binary = self.layers.set_index("layer").loc[layer]["binary"]
+                        selection = chunk["layer"]==l
+                        num_edges = (selection).sum()
+                        # contains values of binary_linktype / 0
+                        if num_edges>0:
+                            A = self.adjacency_matrix(chunk[selection], binary, symmetrize=layer in self.layer_conf["symmetrize"])
+                            print(f"\tAdding {A.nnz} edges to layer {layer}.")
+                            self.A += A
+                            print("\tNumber of nonzero edges in full adjacency matrix:",self.A.nnz)
+                            #temp = dict(zip(zip(*A.nonzero()),A.data))
+                            #print("temp",temp)
+                            #self.A_dict = {
+                            #    key: self.A_dict.get(key,0) | temp.get(key,0) for key in set(self.A_dict.keys()) | temp.keys()
+                            #}
+                            #print("A_dict",self.A_dict)
+                            # cleaning memory of large unnecessary objects
+                            del A#,temp
+            toc = time()
+            print(f"\tFinished with chunk in {round(toc-tic,1)}s.")
+            tic = toc
+
+        #data = list(self.A_dict.values())
+        #i = [elem[0] for elem in self.A_dict.keys()]
+        #j = [elem[1] for elem in self.A_dict.keys()]
+        #self.A = csr_matrix((data,(i,j)),shape=(self.N,self.N),dtype='int8')
+        #del self.A_dict,i,j,data
+
 
     def init_all(self):
         """
         Read all components given in config, and save results to output folder if necessary.
         """
-        self.read_edgelist()
         self.init_layers()
         print(f"LAYERS: {self.layers.shape[0]}")
         self.init_nodes()
         print(f"NODES: {self.nodes.shape[0]}")
         self.init_edges()
-        print(f"EDGES: {self.edgelist.shape[0]}")
         self.read_all_edges()
         print(f"EDGES: {self.A.nnz}")
 

@@ -63,21 +63,16 @@ It is also possible to convert the network to igraph or networkx objects.
 
 """
 
-# TODO ensure that when passing in-memory objects, the dtype of A is int
-
-# change working directory to repo root
-import os
-os.chdir(os.path.dirname(os.path.abspath(__file__)) + '/..')
- 
 # importing libraries
 import pandas as pd
 import polars as pl
 import numpy as np
-
 import igraph as ig
 import networkx as nx
 
-from src.preparation import RawCSVtoMLN
+import gzip
+
+from preparation import RawCSVtoMLN
 
 from scipy.sparse import csr_matrix, save_npz, load_npz, eye, block_diag, kron
 import json
@@ -107,6 +102,7 @@ class MultiLayerNetwork:
         config_path = "",
         verbose = False,
         adjacency_element = "binary",
+        use_polars = False,
         **kwargs
     ):
         """
@@ -224,7 +220,8 @@ class MultiLayerNetwork:
             layers : pandas dataframe
                 dataframe with layer information, at least 'layer' column
             N : int
-                number of nodes
+                number of nodes (does not necessarily correspond to number of active
+                nodes in longitudinal networks)
             L : int
                 number of layers
             adjacency_element : string
@@ -273,10 +270,19 @@ class MultiLayerNetwork:
             self.verboseprint = verboseprint
         else:
             self.verboseprint = lambda *a: None      # do-nothing function
-            
         # check if a valid input exists
         if not load_from_library and not load_from_config and "csr_matrix" not in str(type(edges)):
             raise ValueError("You should either load a saved MLN object, load from raw files, or pass an edge adjacency matrix.")
+    
+        self.use_polars = use_polars
+
+        # TODO document these
+        self.null_values = kwargs.get("null_values",{})
+        self.load_dtypes = kwargs.get("load_dtypes",{})
+        self.final_dtypes = kwargs.get("final_dtypes",{})
+
+        if "usecols" in kwargs:
+            self.usecols = kwargs["usecols"]
         
         # loading from library
         if load_from_library:
@@ -315,7 +321,8 @@ class MultiLayerNetwork:
         # set kwargs as attributes
         for k,v in kwargs.items():
             setattr(self, k, v)
-        
+
+
         if "codebook" in kwargs:
             self.codebook = kwargs["codebook"]
         else:
@@ -332,6 +339,7 @@ class MultiLayerNetwork:
         self._to_pass = {
             "layers" : self.layers,
             "codebook" : self.codebook,
+            "use_polars" : self.use_polars,
             "_verbose" : self._verbose,
             "_layer_conversion_dict" : self._layer_conversion_dict,
             "_max_bin_linktype" : self._max_bin_linktype
@@ -382,7 +390,32 @@ class MultiLayerNetwork:
         if nodes_path.endswith(".pkl"):
             nodes = pd.read_pickle(nodes_path)
         else:
-            nodes = pd.read_csv(nodes_path, index_col=None, header=0)
+            if hasattr(self,'usecols'):
+                if self.use_polars:
+                    kwargs = {"columns": self.usecols}
+                else:
+                    kwargs = {"usecols": self.usecols}
+            else:
+                kwargs = {}
+
+            if self.use_polars:
+                nodes = pl.read_csv(
+                    nodes_path,
+                    has_header=True,
+                    null_values = self.null_values,
+                    dtypes = self.load_dtypes,
+                    low_memory=True, **kwargs
+                )
+                for col in self.load_dtypes:
+                    if col in self.final_dtypes and self.load_dtypes[col]!=self.final_dtypes[col] and col in nodes.columns:
+                        self.nodes = nodes.with_columns(nodes[col].cast(self.final_dtypes[col]))
+            else:
+                nodes = pd.read_csv(
+                    nodes_path, 
+                    index_col=None, 
+                    header=0,
+                    dtype = self.load_dtypes, **kwargs
+            )
         # load edges from npz file
         edges = load_npz(edges_path)
 
@@ -407,9 +440,6 @@ class MultiLayerNetwork:
         layer = self.layers["layer"].tolist()
         # human-readable
         label = self.layers["label"].tolist()
-
-        if "group" in self.layers.columns:
-            group = self.layers["group"].tolist()
         
         bin_to_layer = dict(zip(binary, layer))
         bin_to_label = dict(zip(binary, label))
@@ -417,17 +447,6 @@ class MultiLayerNetwork:
         label_to_bin = dict(zip(label, binary))
         layer_to_bin = dict(zip(layer, binary))
         layer_to_label = dict(zip(layer, label))
-
-        group_add = {}
-
-        if "group" in self.layers.columns:
-            group_to_bin = self.layers.groupby("group")["binary"].sum().to_dict()
-            bin_to_group = {v: k for k, v in group_to_bin.items()}
-            group_add = {            
-                'group_to_binary' : group_to_bin,
-                'binary_to_group' : bin_to_group
-            }
-
         
         self._layer_conversion_dict = {
             'binary_to_layer' : bin_to_layer,
@@ -435,8 +454,7 @@ class MultiLayerNetwork:
             'layer_to_label' : layer_to_label,
             'layer_to_binary' : layer_to_bin,
             'label_to_binary' : label_to_bin,
-            'label_to_layer' : label_to_layer,
-            **group_add
+            'label_to_layer' : label_to_layer
         }
     
     
@@ -472,7 +490,8 @@ class MultiLayerNetwork:
             layers_selected=[], 
             groups_selected=[], 
             node_type="label",
-            layer_type="label"
+            layer_type="label",
+            keep_node_alignment = False
             ):
         """
         Returns MultiLayerNetwork based on node and edge filtering.
@@ -523,10 +542,36 @@ class MultiLayerNetwork:
             # creating True/False mask for faster selection
             idx = np.array(np.zeros(self.N,dtype=bool))
             idx[nodes_selected] = True
-            # slicing the adjacency matrix
-            A_selected = self.A[idx,:][:,idx]
-            # slicing the attribute table
-            nodes_selected = self.nodes.iloc[nodes_selected].reset_index(drop=True)
+
+            if keep_node_alignment:
+                print("Getting indices...")
+                i,j = self.A.nonzero()
+                test = np.isin(i,nodes_selected) & np.isin(j,nodes_selected)
+                selected_i = i[test]
+                del i
+                selected_j = j[test]
+                del j
+                selected_data = self.A.data[test]
+                del test
+                print("Done.")
+                print("Constructing larger matrix...")
+                A_selected = csr_matrix((selected_data,(selected_i,selected_j)),shape=(self.N,self.N),dtype=self.A.dtype)
+                print("Done.")
+                print("Constructing nodes...")
+                if self.use_polars:
+                    nodes_selected = self.nodes.clone() 
+                else:
+                    nodes_selected = self.nodes.copy()
+                nodes_selected["active"] = idx
+                print("Done.")
+            else:
+                # slicing the adjacency matrix
+                A_selected = self.A[idx,:][:,idx]
+                # slicing the attribute table
+                if self.use_polars:
+                    nodes_selected = self.nodes.filter(idx)
+                else:
+                    nodes_selected = self.nodes.iloc[nodes_selected].reset_index(drop=True)
         else:
             A_selected = deepcopy(self.A)
             nodes_selected = self.nodes
@@ -648,7 +693,7 @@ class MultiLayerNetwork:
         self.clear_group_adjacency_matrices()
 
 
-    def get_aggregated_network(self, aggregation_column=None, keep_layers = False):
+    def get_aggregated_network(self, aggregation_column=None, keep_layers = False, convert_A = "none"):
         """
         Return an aggregated network over a certain column in self.nodes.
 
@@ -667,60 +712,75 @@ class MultiLayerNetwork:
                 the column in self.nodes based on which the edges should be aggregated
             -------------
         """
-        A_selected = deepcopy(self.A)
 
         if not aggregation_column in self.nodes.columns:
             raise ValueError(f"Column {aggregation_column} not found in self.nodes. Possible candidates are: ", self.nodes.columns)
         
-        grps, uniques = pd.factorize(self.nodes[aggregation_column])
-
-        # making sure that the unique values are sorted
-        reind = {old_i: new_i for old_i, new_i in enumerate(np.argsort(uniques))}
-        grps = np.array([reind[i] for i in grps])
-        uniques = uniques[np.argsort(uniques)]
-
-        # count how much each group occurs
-        def count_grps(lst):
-            count_dict = {}
-            for num in lst:
-                if num in count_dict:
-                    count_dict[num] += 1
-                else:
-                    count_dict[num] = 1
-            return count_dict
         
-        grp_counts = count_grps(grps)
+        if self.use_polars:
+            mask = self.nodes["active"] & self.nodes[aggregation_column].is_not_null()
+            affil_edgelist = list(zip(self.nodes["label"].filter(mask), self.nodes[aggregation_column].filter(mask)))
+        else:
+            mask = self.nodes["active"] & (~pd.isnull(self.nodes[aggregation_column]))
+            affil_edgelist = list(zip(self.nodes["label"][mask], self.nodes[aggregation_column][mask]))
 
-        i, j = list(range(len(grps))), grps
-        # sparse adjacency matrix for affiliations (work, school, region etc.)
-        ft = csr_matrix((np.ones(len(i)),(i,j)), shape=(self.N,len(grp_counts.keys())), dtype = 'int').T
+        self.create_affiliation_matrix(aggregation_column,affil_edgelist)
 
-       
-        grouped_A = ft.dot(A_selected.sign())
-        grouped_A_2 = grouped_A.dot(ft.T)
-        grouped_A_2 = csr_matrix(grouped_A_2)
+        if convert_A == "boolean":
+            G = self.affiliation_matrix[aggregation_column]["A"].T * self.A.sign() * self.affiliation_matrix[aggregation_column]["A"]
+        elif convert_A == "multiplexity":
+            A = deepcopy(self.A)
+            # create lookup table for mapping binary values to number of layers / multiplexity
+            lookup = {}
+            for num in np.unique(A.data):
+                lookup[num] = bin(num).count("1")
+            # apply lookup table
+            A.data = np.array([lookup[x] for x in A.data])
+            G = self.affiliation_matrix[aggregation_column]["A"].T * A * self.affiliation_matrix[aggregation_column]["A"]
+        elif convert_A == "none":
+            G = self.affiliation_matrix[aggregation_column]["A"].T * self.A * self.affiliation_matrix[aggregation_column]["A"]
+        else:
+            ValueError("Invalid value for convert_A, please choose from none, booelan, or multiplexity.")
+        uniques = [self.affiliation_matrix[aggregation_column]["column_id_to_label"][i] for i in range(self.affiliation_matrix[aggregation_column]["M"])]
+        if 'weight' not in self.nodes.columns:
+            # count occurrences in each aggregation group
+            grp_counts = self.affiliation_matrix[aggregation_column]["A"].sum(axis=0).tolist()[0]
+        else:
+            # sum up previous weights
+            grp_counts = self.nodes[mask].groupby(aggregation_column)['weight'].sum().loc[uniques]
 
-        nodes_selected = pd.DataFrame(data={
-                'label' : uniques, 
-                'weight' : [grp_counts[i] for i in range(0,len(uniques))]}, 
-                index=[i for i in range(0,len(uniques))]
-        )
-        nodes_selected.reset_index(inplace=True)
-        nodes_selected.rename(columns={'index' : 'id'}, inplace=True)
+        if self.use_polars:
+            nodes_selected = pl.DataFrame({
+                    'label' : uniques, 
+                    'weight' : grp_counts, 
+                    "id" : [i for i in range(self.affiliation_matrix[aggregation_column]["M"])]
+                }
+            )
+        else:
+            nodes_selected = pd.DataFrame(data={
+                    'label' : uniques, 
+                    'weight' : grp_counts, 
+                    "id" : [i for i in range(self.affiliation_matrix[aggregation_column]["M"])]
+                }
+            )
 
         # add data related to particular aggregation level
-        aggregation_nodes = self.nodes.groupby([aggregation_column]).head(1)[[c for c in self.nodes.columns if aggregation_column.split('_')[0] in c]]
-        nodes_selected = nodes_selected.merge(aggregation_nodes, left_on=['label'], right_on=[aggregation_column], how='left')
+        if self.use_polars:
+            aggregation_nodes = self.nodes.select([c for c in self.nodes.columns if aggregation_column.split('_')[0] in c]).groupby([aggregation_column]).first()
+            nodes_selected = nodes_selected.join(aggregation_nodes, left_on=['label'], right_on=[aggregation_column], how='left')
+        else:
+            aggregation_nodes = self.nodes.groupby([aggregation_column]).head(1)[[c for c in self.nodes.columns if aggregation_column.split('_')[0] in c]]
+            nodes_selected = nodes_selected.merge(aggregation_nodes, left_on=['label'], right_on=[aggregation_column], how='left')
         
         f = MultiLayerNetwork(
-            edges = grouped_A_2,
+            edges = G.tocsr(),
             nodes = nodes_selected,
             **self._to_pass
         )
 
         # this is only providing raw counts for all selected layers
         # TODO: it would be more elegant to keep layers!
-        selection_layers = pd.DataFrame(data={'layer' : 1, 'label' : 'count', 'label_long' : 'count', 'layer' : 'count', 'binary' : 1}, index=[0])
+        selection_layers = pd.DataFrame(data={'layer' : 1, 'label' : 'count', 'label_long' : 'count_'+convert_A, 'layer' : 'count', 'binary' : 1}, index=[0])
         selection_layers_dict = {
             'binary_to_layer': {1 : 1},
             'binary_to_layer' : {1 : 'count'},
@@ -790,20 +850,38 @@ class MultiLayerNetwork:
         if edge_attribute == "binary" or edge_attribute=="weight":
             # combine edges and weights
             edges_with_weights = np.concatenate((edges, weights), axis=1)
-            edgelist = pd.DataFrame(edges_with_weights, columns = ["source", "target", edge_attribute])
+            if self.use_polars:
+                edgelist = pl.DataFrame(edges_with_weights, schema = ["source", "target", edge_attribute])
+            else:
+                edgelist = pd.DataFrame(edges_with_weights, columns = ["source", "target", edge_attribute])
 
-            # mapping back edges to the original labels
-            edgelist["source"] = edgelist["source"].map(self.to_label)
-            edgelist["target"] = edgelist["target"].map(self.to_label)
+            if self.use_polars:
+                # mapping back edges to the original labels
+                edgelist = edgelist.with_column(
+                    pl.col("source").map_dict(self.to_label).alias("source"),
+                    pl.col("target").map_dict(self.to_label).alias("target")
+                )
+            else:
+                # mapping back edges to the original labels
+                edgelist["source"] = edgelist["source"].map(self.to_label)
+                edgelist["target"] = edgelist["target"].map(self.to_label)
 
         elif edge_attribute == "layer" or edge_attribute == "label":
             edges_with_weights = np.concatenate((edges, weights), axis=1)
-            edgelist = pd.DataFrame(edges_with_weights, columns = ["source", "target", "binary"])
+            if self.use_polars:
+                edgelist = pl.DataFrame(edges_with_weights, schema = ["source", "target", "binary"])
+            else:
+                edgelist = pd.DataFrame(edges_with_weights, columns = ["source", "target", "binary"])
             # self.report_time(message = "Creating edgelist dataframe.")
-    
-            # mapping back edges to the original labels
-            edgelist["source"] = edgelist["source"].map(self.to_label)
-            edgelist["target"] = edgelist["target"].map(self.to_label)
+            if self.use_polars:
+                edgelist = edgelist.with_column(
+                    pl.col("source").map_dict(self.to_label).alias("source"),
+                    pl.col("target").map_dict(self.to_label).alias("target")
+                )
+            else:
+                # mapping back edges to the original labels
+                edgelist["source"] = edgelist["source"].map(self.to_label)
+                edgelist["target"] = edgelist["target"].map(self.to_label)
             # self.report_time(message = "Remapping node labels.")
     
             # add colnames and (human) readable link types
@@ -816,21 +894,39 @@ class MultiLayerNetwork:
             # print(edgelist.head())
 
             # get pairs (binary_linktype, label) of each link
-            edgelist[edge_attribute] = edgelist["binary"].map(link_dict)
+            if self.use_polars:
+                # get pairs (binary_linktype, label) of each link
+                edgelist = edgelist.with_column(
+                    pl.col("binary").map_dict(link_dict).alias(edge_attribute)
+                )
+            else:
+                edgelist[edge_attribute] = edgelist["binary"].map(link_dict)
             # self.report_time(message = "Mapped binary link identifiers.")
             # print(edgelist.head())
 
-            edgelist.drop("binary", axis=1, inplace=True)
+            if self.use_polars:
+                 edgelist.drop("binary")
+            else:
+                edgelist.drop("binary", axis=1, inplace=True)
             edgelist = edgelist.explode(edge_attribute)
             # self.report_time(message = "Exploded binary link identifiers.")
             # print(edgelist.head())
             # self.report_time(message = "Adding that to dataframe?")
             # print(edgelist.head())
         elif edge_attribute is None:
-            edgelist = pd.DataFrame(edges, columns = ["source", "target"])
-            # mapping back edges to the original labels
-            edgelist["source"] = edgelist["source"].map(self.to_label)
-            edgelist["target"] = edgelist["target"].map(self.to_label)
+            if self.use_polars:
+                edgelist = pl.DataFrame(edges, schema = ["source", "target"])
+            else:
+                edgelist = pd.DataFrame(edges, columns = ["source", "target"])
+            if self.use_polars:
+                edgelist = edgelist.with_column(
+                    pl.col("source").map_dict(self.to_label).alias("source"),
+                    pl.col("target").map_dict(self.to_label).alias("target")
+                )
+            else:
+                # mapping back edges to the original labels
+                edgelist["source"] = edgelist["source"].map(self.to_label)
+                edgelist["target"] = edgelist["target"].map(self.to_label)
         else:
             raise ValueError(f"Invalid edge_attribute '{edge_attribute}'. Please choose from 'binary', 'layer', 'label' or 'weight' or None.")
         
@@ -1038,7 +1134,7 @@ class MultiLayerNetwork:
             raise ValueError(f"Layer binary value {num} is not a valid linktype in the network.")
 
         return [self.convert_layer_representation(2**i, input_type='binary', output_type=output_type)\
-                 for i in range(self.layers.index[-1]) if int(num)&(2**i)>0]
+                 for i in range(self.layers.index[-1]+1) if int(num)&(2**i)>0]
     
     def save_to_graphml(self, 
                         file_name, 
@@ -1142,9 +1238,16 @@ class MultiLayerNetwork:
         
         _, extension = os.path.splitext(file_name)
         if extension == ".csv":
-            self.nodes.to_csv(file_name)
+            if self.use_polars:
+                self.nodes.write_csv(file_name, include_header = True)
+            else:
+                self.nodes.to_csv(file_name)
         elif extension == ".gz":
-            self.nodes.to_csv(file_name, compression="gzip")
+            if self.use_polars:
+                with gzip.open(file_name,"wb") as f:
+                    self.nodes.write_csv(f, include_header = True)
+            else:
+                self.nodes.to_csv(file_name, compression="gzip")
         else:
             raise ValueError(f"Error: {extension} is not a valid file extension for node saving.")
             
@@ -1266,7 +1369,7 @@ class MultiLayerNetwork:
         for k in range(1, depth):
             next_neighbors = self.A[selected].indices
             # there might be circles when looking for new neighbors, so we take unique integer ids
-            selected = pd.unique(np.concatenate((selected, next_neighbors)))
+            selected = np.unique(np.concatenate((selected, next_neighbors)))
  
         selected = list(map(lambda x: self._map_id_to_label[x], selected))
  
@@ -1401,13 +1504,13 @@ class MultiLayerNetwork:
         If you also want to select layers, we suggest using the get_filtered_network method first.
         """
         if len(selected_nodes)==0:
-            selected_nodes = self.nodes["label"].tolist()
+            selected_nodes = list(self.nodes["label"])
         
         selected_nodes = [self.to_id(n) for n in selected_nodes]
 
         return dict(zip([self.to_label(n) for n in selected_nodes], self.A[selected_nodes, :].sign().sum(axis=0).tolist()[0]))
 
-    def get_clustering_coefficient(self, selected_nodes=[],node_type = "label",batchsize=100000):
+    def get_clustering_coefficient(self, selected_nodes=[],batchsize=100000):
         """
         Calculate clustering coefficient for selected nodes with selected layers.
 
@@ -1425,10 +1528,9 @@ class MultiLayerNetwork:
             
         """
         if len(selected_nodes)==0:
-            selected_nodes = self.nodes["label"].tolist()
-
-        if node_type == "label":
-            selected_nodes = [self.to_id(n) for n in selected_nodes]
+            selected_nodes = list(self.nodes["label"])
+        
+        selected_nodes = [self.to_id(n) for n in selected_nodes]
 
         if batchsize > len(selected_nodes):
             batchsize = len(selected_nodes)
@@ -1460,9 +1562,6 @@ class MultiLayerNetwork:
 
         # we ensure that division by zero errors are correctly handled and nan/inf
         # values are avoided
-
-        print("triangles",triangles)
-        print("P",P)
 
         # triangles / P
         clustering_coefficient = np.divide(triangles, P, out=np.zeros(len(selected_nodes)), where=P!=0)
@@ -1498,31 +1597,68 @@ class MultiLayerNetwork:
 
         return self.sA
     
-    def get_excess_closure(self, selected_nodes=[], node_type="label", selected_layers=[], layer_type = "layer", batchsize=100000):
+    def get_grouped_mln(self):
+        """
+        Returns an MLN object with the same nodelist, 
+        but modified edge adjacency matrix and layer
+        dataframe according to the 'group' column in
+        self.layers. Combines edges whose layertype belongs to
+        the group to into one single layer.
+        """
+        self.gA = csr_matrix((self.N,self.N),dtype=np.uint8)
+        groups = self.layers["group"].unique()
+
+        self.g_layers = pd.DataFrame(groups,columns=["label"])
+        self.g_layers["layer"] = self.g_layers.index+1
+        self.g_layers["binary"] = self.g_layers.index.map(lambda i: int(2**i))
+
+        print(self.g_layers)
+
+        for g in groups:
+            b = self.g_layers.set_index("label")["binary"].loc[g]
+            print(f"Creating adjacency matrix for group layer {g}...")
+            if g not in self.group_adjacency_matrix:
+                glA = self.get_layer_adjacency_matrix(g,layer_type="group",dtype=np.uint8)
+            else:
+                glA = csr_matrix(self.group_adjacency_matrix[g],shape=(self.N,self.N),dtype=np.uint8)
+            print("Done.")
+            print(f"Adding {glA.nnz} edges to layer {g}...")
+            self.gA+=glA*b
+            print("Done.")
+
+
+        return MultiLayerNetwork(
+            nodes = self.nodes,
+            edges = self.gA,
+            layers = self.g_layers
+        )
+    
+    def get_excess_closure(self, selected_nodes=[], node_type="label", selected_layers=[], layer_type="layer", batchsize=100000):
         """
         Calculate the measure called excess closure for selected nodes and layers.
 
-        See Bokanyi et al. 2023 for more details.
+        See Bokany et al. 2023 for more details.
         """
 
-        # ====================== input handling ========================
+        # ===================== input handling =========================
 
         # handling layer input
+        self.verboseprint("Handling layer input...")
         if layer_type not in ["label", "layer", "binary", "group"]:
             raise ValueError(f"Invalid layer_type '{layer_type}'. Please choose from 'label' or 'layer' or 'binary'.")
-        
+
         for layer in selected_layers:
             if layer not in self.layers[layer_type].tolist():
                 raise ValueError(f"Invalid layer '{layer}' for layer_type '{layer_type}'. Please choose from {self.layers[layer_type].unique().tolist()}.")
-        
-        if len(selected_layers)==0:
+
+        if len(selected_layers) == 0:
             selected_layers = self.layers[layer_type].unique().tolist()
 
-        # get corresponding binary representation
+        # get corresonding binary representation
         binary_repr = sum([self._layer_conversion_dict[f"{layer_type}_to_binary"][layer] for layer in selected_layers])
-    
+
         # handling node input
-        if len(selected_nodes)==0:
+        if len(selected_nodes) == 0:
             selected_nodes = self.nodes["id"].tolist()
         else:
             if node_type == "label":
@@ -1531,16 +1667,18 @@ class MultiLayerNetwork:
                 pass
             else:
                 raise ValueError(f"Invalid node_type '{node_type}'. Please choose from 'label' or 'id'.")
+        self.verboseprint("Done.")
 
         # ====================== actual calculation ========================
         # obtain a copy of the sparse adjacency matrix such that each element
         # A[i,j] contains the number of links between i and j
+        self.verboseprint("Getting multiplexity counts of full matrix...")
         A = deepcopy(self.A)
         A.data = A.data & binary_repr
         # this is necessary, otherwise the denominators will not be correct
         # (we're using indptr and indices to calculate neighbor degrees)
         A.eliminate_zeros()
-
+        
 
         # create lookup table for mapping binary values to number of layers / multiplexity
         lookup = {}
@@ -1548,7 +1686,9 @@ class MultiLayerNetwork:
             lookup[num] = bin(num).count("1")
         # apply lookup table
         A.data = np.array([lookup[x] for x in A.data])
+        self.verboseprint("Done.")
 
+        self.verboseprint("Total number of triangles...")
         # find all triangles
         triangles = np.empty(0, dtype=np.int64)
         # B = A @ A @ A contains the number of paths of length 3 between B[i,j]
@@ -1557,54 +1697,96 @@ class MultiLayerNetwork:
         # // 2 as every path is found in both directions
         # B will not fit in memory, so we do this in steps
         for i in range(0, len(selected_nodes), batchsize):
+            self.verboseprint(f"\tBatch {i}/{len(selected_nodes)//batchsize+1}")
             start = i
-            end = i+batchsize
-            # if end is larger than matrix size, let it be the matrixsize
+            end = i + batchsize
+            # if end is larger than matrix size, let it be the matrix size
             if end > len(selected_nodes):
                 end = len(selected_nodes)
-            A_ = A[selected_nodes[start:end],:]
+            A_ = A[selected_nodes[start:end], :]
             res = (A_ @ A @ A_.T).diagonal() // 2
             triangles = np.concatenate((triangles, res))
+        self.verboseprint("Done.")
 
+        self.verboseprint("Pure triangle count...")
         # get number of triangles which only use 1 layer
         pure_triangles = np.zeros(len(selected_nodes))
         for layer in selected_layers:
+            self.verboseprint(f"\tLayer {layer}...")
             t = np.empty(0, dtype=np.int64)
             lA = self.get_layer_adjacency_matrix(layer=layer, layer_type=layer_type)
-            for i in range(0,  len(selected_nodes), batchsize):
+            self.verboseprint("\tStart calc...")
+            for i in range(0, len(selected_nodes), batchsize):
                 start = i
-                end = i+batchsize
-                # if end is larger than matrix size, let it be the matrixsize
+                end = i + batchsize
+                # if end is larger than matrix size, let it be the matrix size
                 if end > len(selected_nodes):
                     end = len(selected_nodes)
-                A_ = lA[selected_nodes[start:end],:]
+                A_ = lA[selected_nodes[start:end], :]
                 res = (A_ @ lA @ A_.T).diagonal() // 2
                 t = np.concatenate((t, np.array(res)))
+            self.verboseprint("\tEnd calc...")
             pure_triangles += t
+        self.verboseprint("Done.")
 
+        self.verboseprint("Calculating denominator...")
         # decrease matrix size to only selected nodes
-        A = A[selected_nodes,:]
+        A = A[selected_nodes, :]
 
         # compute the denominator
         # sum of neighbor degrees, over 2
         l = comb(A.sum(axis=1), 2)
-        # sum of: neighbor degrees over two
-        r = csr_matrix((comb(A.data, 2), A.indices, A.indptr),(len(selected_nodes),self.N)).sum(axis=1)
+        # sum of: neighbor degrees over 2
+        r = csr_matrix((comb(A.data, 2), A.indices, A.indptr), (len(selected_nodes), self.N)).sum(axis=1)
         P = np.array(l - r).T[0]
-        # we ensure that division by zero errors are correctly handled and nan/inf
-        # values are avoided    
+        # we ensure that division by zero erros are correctly handled and nan/inf
+        # values are avoided
+        self.verboseprint("Done.")
 
-        # pure_triangles / P
-        Cpure = np.divide(pure_triangles, P, out=np.zeros(len(selected_nodes)), where=P!=0)
+        # pure triangles / P
+        Cpure = np.divide(pure_triangles, P, out=np.zeros(len(selected_nodes)), where=P!= 0)
         # triangles / P
-        Cunique = np.divide(triangles, P, out=np.zeros(len(selected_nodes)), where=P!=0)
+        Cunique = np.divide(triangles, P, out=np.zeros(len(selected_nodes)), where=P!= 0)
 
-        # (Cunique - Cpure) / (1 - Cpure)
-        excess_closure = np.divide(Cunique-Cpure, 1-Cpure, out=np.zeros(len(selected_nodes)), where=(1-Cpure)!=0)
+        # (Cunique - Cpure / 1 - Cpure)
+        excess_closure = np.divide(Cunique-Cpure, 1-Cpure, out=np.zeros(len(selected_nodes)), where=(1-Cpure)!= 0)
         clustering_coefficient = Cunique
 
         return {
-            "clustering_coefficient": dict(zip([self.to_label(n) for n in selected_nodes],clustering_coefficient)),
-            "excess_closure": dict(zip([self.to_label(n) for n in selected_nodes],excess_closure))
+            "clustering_coefficient": dict(zip([self.to_label(n) for n in selected_nodes], clustering_coefficient)),
+            "excess_closure": dict(zip([self.to_label(n) for n in selected_nodes], excess_closure))
         }
 
+    def add_nodes(self,nodes_df):
+        if "label" not in nodes_df:
+            raise ValueError("The dataframe should contains at least a column called label.")
+        M = nodes_df.shape[0]
+        nodes_df["id"] = range(self.N,self.N+M)
+        self.N = self.N + M
+        self._map_id_to_label.update(dict(zip(nodes_df["id"],nodes_df["label"])))
+        self._map_label_to_id.update(dict(zip(nodes_df["label"],nodes_df["id"])))
+        self.nodes = pd.concat([self.nodes,nodes_df],axis=0)
+        self.nodes.index = self.nodes["id"]
+        self.A = block_diag([self.A,csr_matrix((M,M))],format="csr")
+
+    def remove_nodes(self,nodes):
+        if any(self.nodes.index!=self.nodes.id):
+            raise ValueError("Node dataframe not aligned correcly for operation.")
+        mask = ~self.nodes["label"].isin(nodes)
+        self.nodes = self.nodes[mask].copy()
+        self.nodes.reset_index(drop=True,inplace=True)
+        self.nodes["id"] = self.nodes.index
+        self._map_id_to_label = dict(zip(self.nodes["id"],self.nodes["label"]))
+        self._map_label_to_id = dict(zip(self.nodes["label"],self.nodes["id"]))
+        self.N = mask.sum()
+        self.A = self.A[mask,:][:,mask]
+
+
+
+
+
+
+
+
+
+                
