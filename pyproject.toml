@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mln"
+version = "0.2.1"
+authors = [
+  { name="Eszter Bokányi", email="e.bokanyi@uva.nl" },
+]
+description = "Library for working with large multilayer networks by the POPNET group."
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "pandas>=1.4.4",
+    "polars>=0.20.7",
+    "numpy>=1.20.3",
+    "python-igraph=0.9.9",
+    "networkx>=3.1",
+    "scipy>=1.20.1"
+]
+
+[project.urls]
+Homepage = "https://github.com/popnet-io/popnet_mln"
+Issues = "https://github.com/popnet-io/popnet_mln/issues"
