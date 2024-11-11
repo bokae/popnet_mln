@@ -72,7 +72,7 @@ import networkx as nx
 
 import gzip
 
-from preparation import RawCSVtoMLN
+from mln.preparation import RawCSVtoMLN
 
 from scipy.sparse import csr_matrix, save_npz, load_npz, eye, block_diag, kron
 import json
