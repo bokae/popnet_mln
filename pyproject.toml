@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mln"
-version = "0.2.2"
+version = "0.2.2sour"
 authors = [
   { name="Eszter Bokányi", email="e.bokanyi@uva.nl" },
 ]
@@ -22,7 +22,7 @@ dependencies = [
     "numpy>1.20.3",
     "python-igraph>0.9.9",
     "networkx>3.1",
-    "scipy>1.20.1"
+    "scipy>1.10.1"
 ]
 
 [project.urls]
