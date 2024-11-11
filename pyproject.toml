@@ -17,12 +17,12 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "pandas>=1.4.4",
-    "polars>=0.20.7",
-    "numpy>=1.20.3",
-    "python-igraph=0.9.9",
-    "networkx>=3.1",
-    "scipy>=1.20.1"
+    "pandas>1.4.4",
+    "polars>0.20.7",
+    "numpy>1.20.3",
+    "python-igraph>0.9.9",
+    "networkx>3.1",
+    "scipy>1.20.1"
 ]
 
 [project.urls]
