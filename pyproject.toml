@@ -3,12 +3,12 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mln"
-version = "0.2.32"
+name = "mlnlib"
+version = "0.2.35"
 authors = [
   { name="Eszter Bokányi", email="e.bokanyi@uva.nl" },
 ]
-description = "Library for working with large multilayer networks by the POPNET group."
+description = "Memory-efficient library for loading and working with large unweighted multilayer networks."
 readme = "README.md"
 requires-python = ">=3.8"
 classifiers = [
@@ -17,12 +17,12 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "pandas>1.4.4",
-    "polars>0.20.6",
-    "numpy>1.20.3",
-    "python-igraph>0.9.9",
-    "networkx>3.0",
-    "scipy>1.10.1"
+    "pandas>=1.4.4",
+    "polars>=0.20.6",
+    "numpy>=1.20.3",
+    "python-igraph>=0.9.9",
+    "networkx>=3.0",
+    "scipy>=1.10.1"
 ]
 
 [project.urls]
