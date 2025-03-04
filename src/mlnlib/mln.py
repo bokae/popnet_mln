@@ -1673,6 +1673,111 @@ class MultiLayerNetwork:
         self.N = mask.sum()
         self.A = self.A[mask,:][:,mask]
 
+    def get_aggregated_network(self, aggregation_column=None, keep_layers = False, convert_A = "none"):
+            """
+            Return an aggregated network over a certain column in self.nodes.
+
+            It looks at unique values in the column, and aggregates the edges for
+            each unique value. The resulting network has as many nodes as there
+            are unique values in the column. The edges are aggregated by counting all
+            edges from all layers that go between the groups.
+
+            The resulting network is a MultiLayerNetwork object, but instead of the binary
+            adjacency matrix, it has a weighted adjacency matrix, where the weights are
+            the edge counts between the groups.
+            
+            Parameters:
+                -------------
+                aggregation_column : string, default None
+                    the column in self.nodes based on which the edges should be aggregated
+                -------------
+            """
+
+            if not aggregation_column in self.nodes.columns:
+                raise ValueError(f"Column {aggregation_column} not found in self.nodes. Possible candidates are: ", self.nodes.columns)
+            
+            
+            if self.use_polars:
+                mask = self.nodes["active"] & self.nodes[aggregation_column].is_not_null()
+                affil_edgelist = list(zip(self.nodes["label"].filter(mask), self.nodes[aggregation_column].filter(mask)))
+            else:
+                mask = self.nodes["active"] & (~pd.isnull(self.nodes[aggregation_column]))
+                affil_edgelist = list(zip(self.nodes["label"][mask], self.nodes[aggregation_column][mask]))
+
+            self.create_affiliation_matrix(aggregation_column,affil_edgelist)
+
+            if convert_A == "boolean":
+                G = self.affiliation_matrix[aggregation_column]["A"].T * self.A.sign() * self.affiliation_matrix[aggregation_column]["A"]
+            elif convert_A == "multiplexity":
+                A = deepcopy(self.A)
+                # create lookup table for mapping binary values to number of layers / multiplexity
+                lookup = {}
+                for num in np.unique(A.data):
+                    lookup[num] = bin(num).count("1")
+                # apply lookup table
+                A.data = np.array([lookup[x] for x in A.data])
+                G = self.affiliation_matrix[aggregation_column]["A"].T * A * self.affiliation_matrix[aggregation_column]["A"]
+            elif convert_A == "none":
+                G = self.affiliation_matrix[aggregation_column]["A"].T * self.A * self.affiliation_matrix[aggregation_column]["A"]
+            else:
+                ValueError("Invalid value for convert_A, please choose from none, booelan, or multiplexity.")
+            uniques = [self.affiliation_matrix[aggregation_column]["column_id_to_label"][i] for i in range(self.affiliation_matrix[aggregation_column]["M"])]
+            if 'weight' not in self.nodes.columns:
+                # count occurrences in each aggregation group
+                grp_counts = self.affiliation_matrix[aggregation_column]["A"].sum(axis=0).tolist()[0]
+            else:
+                # sum up previous weights
+                grp_counts = self.nodes[mask].groupby(aggregation_column)['weight'].sum().loc[uniques]
+
+            if self.use_polars:
+                nodes_selected = pl.DataFrame({
+                        'label' : uniques, 
+                        'weight' : grp_counts, 
+                        "id" : [i for i in range(self.affiliation_matrix[aggregation_column]["M"])]
+                    }
+                )
+            else:
+                nodes_selected = pd.DataFrame(data={
+                        'label' : uniques, 
+                        'weight' : grp_counts, 
+                        "id" : [i for i in range(self.affiliation_matrix[aggregation_column]["M"])]
+                    }
+                )
+
+            # add data related to particular aggregation level
+            if self.use_polars:
+                aggregation_nodes = self.nodes.select([c for c in self.nodes.columns if aggregation_column.split('_')[0] in c]).groupby([aggregation_column]).first()
+                nodes_selected = nodes_selected.join(aggregation_nodes, left_on=['label'], right_on=[aggregation_column], how='left')
+            else:
+                aggregation_nodes = self.nodes.groupby([aggregation_column]).head(1)[[c for c in self.nodes.columns if aggregation_column.split('_')[0] in c]]
+                nodes_selected = nodes_selected.merge(aggregation_nodes, left_on=['label'], right_on=[aggregation_column], how='left')
+            
+            f = MultiLayerNetwork(
+                edges = G.tocsr(),
+                nodes = nodes_selected,
+                **self._to_pass
+            )
+
+            # this is only providing raw counts for all selected layers
+            # TODO: it would be more elegant to keep layers!
+            selection_layers = pd.DataFrame(data={'layer' : 1, 'label' : 'count', 'label_long' : 'count_'+convert_A, 'layer' : 'count', 'binary' : 1}, index=[0])
+            selection_layers_dict = {
+                'binary_to_layer': {1 : 1},
+                'binary_to_layer' : {1 : 'count'},
+                'layer_to_layer' : {1 : 'count'},
+                'layer_to_binary' : {1 : 1},
+                'layer_to_binary' : {'count' : 1},
+                'layer_to_layer' : {'count' : 1}
+            }
+
+            f.layers = selection_layers
+            f._layer_conversion_dict = selection_layers_dict
+            # The nodes have changed, therefore new mappings for to_nid and to_label are passed.
+            f._map_label_to_id = dict(zip(f.nodes["label"],f.nodes["id"]))
+            f._map_id_to_label = dict(zip(f.nodes["id"],f.nodes["label"]))
+            f.adjacency_element = "weight"
+
+            return f
 
 
 
@@ -1681,4 +1786,5 @@ class MultiLayerNetwork:
 
 
 
-                
+
+                    
