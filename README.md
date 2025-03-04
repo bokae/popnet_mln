@@ -77,7 +77,7 @@ Example loadings:
 ```
 # FROM FILES
 # import custom class for the network from mln
-import MultiLayeredNetwork
+from mlnlib.mln import MultiLayeredNetwork
 
 # read the whole network
 popnet = MultiLayeredNetwork(
@@ -87,7 +87,7 @@ popnet = MultiLayeredNetwork(
 
 # FROM MEMORY
 # import custom class for the network
-from mln import MultiLayeredNetwork
+from mlnlib.mln import MultiLayeredNetwork
 
 # read the whole network
 popnet = MultiLayeredNetwork(
@@ -97,7 +97,7 @@ popnet = MultiLayeredNetwork(
 
 # FROM LIBRARY
 # import custom class for the network
-from mln import MultiLayeredNetwork
+from mlnlib.mln import MultiLayeredNetwork
 
 # read the whole network
 popnet = MultiLayeredNetwork(
